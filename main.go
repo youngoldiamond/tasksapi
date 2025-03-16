@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
+	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 var db *sql.DB
@@ -23,15 +25,110 @@ type Task struct {
 	Done    bool   `json:"done"`
 }
 
+type User struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type Claims struct {
+	Username string `json:"username"`
+	jwt.StandardClaims
+}
+
+func register(c *gin.Context) {
+	var newUser User
+
+	if err := c.BindJSON(&newUser); err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+
+	query := `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING user_id`
+	err := db.QueryRow(query, newUser.Username, newUser.Password).Scan(&newUser.ID)
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+
+	createTableQuery := `CREATE TABLE %v (
+		task_id serial PRIMARY KEY,
+		body varchar(100) NOT NULL,
+		date varchar(10),
+		project varchar(30),
+		context varchar(30),
+		done BOOLEAN
+	)`
+	createTableQuery = fmt.Sprintf(createTableQuery, pq.QuoteIdentifier(newUser.Username))
+
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+
+	c.IndentedJSON(http.StatusOK, gin.H{"message": "User registered successfully"})
+}
+
+func login(c *gin.Context) {
+	var credentials struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := c.BindJSON(&credentials); err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+
+	var user User
+	row := db.QueryRow("SELECT * FROM users WHERE username = $1", credentials.Username)
+	if err := row.Scan(&user.ID, &user.Username, &user.Password); err != nil {
+		var mess string
+		if err == sql.ErrNoRows {
+			mess = "Invalid username"
+		} else {
+			mess = err.Error()
+		}
+		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": mess})
+		return
+	}
+
+	if user.Password != credentials.Password {
+		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": "Invalid password"})
+	}
+
+	expirationTime := time.Now().Add(time.Minute * 5)
+	claims := &Claims{
+		Username: credentials.Username,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokeString, err := token.SignedString([]byte("my-test-secret-key"))
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+
+	c.IndentedJSON(http.StatusOK, gin.H{"token": tokeString})
+}
+
 func getTasks(c *gin.Context) {
 	var tasks []Task
 
-	rows, err := db.Query("SELECT * FROM tasks")
+	table := pq.QuoteIdentifier(c.Param("username"))
+	query := fmt.Sprintf("SELECT * FROM %v", table)
+
+	rows, err := db.Query(query)
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
 	}
 	defer rows.Close()
+
 	for rows.Next() {
 		var task Task
 		if err := rows.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
@@ -52,13 +149,10 @@ func postTask(c *gin.Context) {
 		return
 	}
 
-	row := db.QueryRow("SELECT * FROM tasks WHERE task_id = $1", newTask.ID)
-	if row.Err() == nil {
-		c.IndentedJSON(http.StatusOK, gin.H{"message": "Task already exists. Try POST tasks/:id if you want to update"})
-		return
-	}
+	table := pq.QuoteIdentifier(c.Param("username"))
+	query := fmt.Sprintf("INSERT INTO %v (body, date, project, context, done) VALUES ($1, $2, $3, $4, $5)", table)
 
-	result, err := db.Exec("INSERT INTO tasks (body, date, project, context, done) VALUES ($1, $2, $3, $4, $5)", newTask.Body, newTask.Date, newTask.Project, newTask.Context, newTask.Done)
+	result, err := db.Exec(query, newTask.Body, newTask.Date, newTask.Project, newTask.Context, newTask.Done)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -74,13 +168,16 @@ func postTask(c *gin.Context) {
 
 func getTaskByID(c *gin.Context) {
 	var task Task
-	id, err := strconv.Atoi(c.Param("id"))
+	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
 	}
 
-	row := db.QueryRow("SELECT * FROM tasks WHERE task_id = $1", id)
+	table := pq.QuoteIdentifier(c.Param("username"))
+	query := fmt.Sprintf("SELECT * FROM %v WHERE task_id = $1", table)
+
+	row := db.QueryRow(query, id)
 	if err := row.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
@@ -91,7 +188,7 @@ func getTaskByID(c *gin.Context) {
 func updateTask(c *gin.Context) {
 	var task Task
 
-	id, err := strconv.Atoi(c.Param("id"))
+	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
@@ -102,7 +199,10 @@ func updateTask(c *gin.Context) {
 		return
 	}
 
-	_, err = db.Exec("UPDATE tasks SET body = $1, date = $2, project = $3, context = $4, done = $5 WHERE task_id = $6", task.Body, task.Date, task.Project, task.Context, task.Done, id)
+	table := pq.QuoteIdentifier(c.Param("username"))
+	query := fmt.Sprintf("UPDATE %v SET body = $1, date = $2, project = $3, context = $4, done = $5 WHERE task_id = $6", table)
+
+	_, err = db.Exec(query, task.Body, task.Date, task.Project, task.Context, task.Done, id)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -117,21 +217,23 @@ func main() {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer db.Close()
 
 	pingErr := db.Ping()
 	if pingErr != nil {
-		panic(pingErr)
+		log.Fatal(pingErr)
 	}
 	log.Println("Connected to DB")
 
 	router := gin.Default()
-	router.GET("/tasks", getTasks)
-	router.GET("/tasks/:id", getTaskByID)
-	router.POST("/tasks", postTask)
-	router.POST("/tasks/:id", updateTask)
+	router.POST("/register", register)
+	router.GET("/login", login)
+	router.GET("/:username/tasks", getTasks)
+	router.GET("/:username/tasks/:taskId", getTaskByID)
+	router.POST("/:username/tasks", postTask)
+	router.PUT("/:username/tasks/:taskId", updateTask)
 
 	router.Run("localhost:8080")
 }
