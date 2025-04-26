@@ -16,6 +16,8 @@ import (
 
 var db *sql.DB
 
+const secretKey = "my-test-secret-key"
+
 type Task struct {
 	ID      int64  `json:"id"`
 	Body    string `json:"body"`
@@ -25,10 +27,14 @@ type Task struct {
 	Done    bool   `json:"done"`
 }
 
-type User struct {
-	ID       int64  `json:"id"`
+type Credentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type User struct {
+	ID int64
+	Credentials
 }
 
 type Claims struct {
@@ -36,10 +42,49 @@ type Claims struct {
 	jwt.StandardClaims
 }
 
+func main() {
+	pass := os.Getenv("MYPASS")
+	connStr := fmt.Sprintf("user=postgres password=%s dbname=tasks sslmode=disable", pass)
+	var err error
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	pingErr := db.Ping()
+	if pingErr != nil {
+		log.Fatal(pingErr)
+	}
+	log.Println("Connected to DB")
+
+	router := setupRouter()
+
+	router.Run("localhost:8080")
+}
+
+func setupRouter() *gin.Engine {
+	router := gin.Default()
+	router.POST("/register", register)
+	router.GET("/login", login)
+	router.GET("/:username/tasks", authMiddleware, getTasks)
+	router.POST("/:username/tasks", authMiddleware, postTask)
+	router.GET("/:username/tasks/:taskId", authMiddleware, getTaskByID)
+	router.PUT("/:username/tasks/:taskId", authMiddleware, updateTask)
+	router.DELETE("/:username/tasks/:taskId", authMiddleware, deleteTask)
+	router.GET("/:username/projects", authMiddleware, getField("project"))
+	router.GET("/:username/contexts", authMiddleware, getField("context"))
+	router.GET("/:username/dates", authMiddleware, getField("date"))
+	router.GET("/:username/projects/:value", authMiddleware, getByField("project"))
+	router.GET("/:username/contexts/:value", authMiddleware, getByField("context"))
+	router.GET("/:username/dates/:value", authMiddleware, getByField("date"))
+	return router
+}
+
 func register(c *gin.Context) {
 	var newUser User
 
-	if err := c.BindJSON(&newUser); err != nil {
+	if err := c.BindJSON(&newUser.Credentials); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
@@ -71,10 +116,7 @@ func register(c *gin.Context) {
 }
 
 func login(c *gin.Context) {
-	var credentials struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
+	var credentials Credentials
 
 	if err := c.BindJSON(&credentials); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
@@ -107,13 +149,41 @@ func login(c *gin.Context) {
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
-	tokeString, err := token.SignedString([]byte("my-test-secret-key"))
+	tokeString, err := token.SignedString([]byte(secretKey))
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
 
 	c.IndentedJSON(http.StatusOK, gin.H{"token": tokeString})
+}
+
+func authMiddleware(c *gin.Context) {
+	tokenString := c.GetHeader("Authorization")
+	if tokenString == "" {
+		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": "Missing token"})
+		c.Abort()
+		return
+	}
+
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
+		return []byte(secretKey), nil
+	})
+
+	if err != nil || !token.Valid {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		c.Abort()
+		return
+	}
+
+	if claims.Username != c.Param("username") {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "You don't have access"})
+		c.Abort()
+		return
+	}
+
+	c.Next()
 }
 
 func getTasks(c *gin.Context) {
@@ -168,9 +238,10 @@ func postTask(c *gin.Context) {
 
 func getTaskByID(c *gin.Context) {
 	var task Task
+
 	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
-		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "Invalid task's ID"})
 		return
 	}
 
@@ -190,7 +261,7 @@ func updateTask(c *gin.Context) {
 
 	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
-		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid task's ID"})
 		return
 	}
 
@@ -211,29 +282,83 @@ func updateTask(c *gin.Context) {
 	c.IndentedJSON(http.StatusCreated, task)
 }
 
-func main() {
-	pass := os.Getenv("MYPASS")
-	connStr := fmt.Sprintf("user=postgres password=%s dbname=tasks sslmode=disable", pass)
-	var err error
-	db, err = sql.Open("postgres", connStr)
+func deleteTask(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
-		log.Fatal(err)
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid task's ID"})
+		return
 	}
-	defer db.Close()
 
-	pingErr := db.Ping()
-	if pingErr != nil {
-		log.Fatal(pingErr)
+	table := pq.QuoteIdentifier(c.Param("username"))
+	query := fmt.Sprintf("DELETE FROM %v WHERE task_id = $1", table)
+
+	_, err = db.Exec(query, id)
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
 	}
-	log.Println("Connected to DB")
 
-	router := gin.Default()
-	router.POST("/register", register)
-	router.GET("/login", login)
-	router.GET("/:username/tasks", getTasks)
-	router.GET("/:username/tasks/:taskId", getTaskByID)
-	router.POST("/:username/tasks", postTask)
-	router.PUT("/:username/tasks/:taskId", updateTask)
+	c.IndentedJSON(http.StatusOK, gin.H{"message": "Task was deleted successfully"})
+}
 
-	router.Run("localhost:8080")
+func getField(fieldName string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		isContain := make(map[string]bool, 5)
+		ans := make([]string, 0, 5)
+
+		table := pq.QuoteIdentifier(c.Param("username"))
+		column := pq.QuoteIdentifier(fieldName)
+		query := fmt.Sprintf("SELECT %v FROM %v", column, table)
+
+		rows, err := db.Query(query)
+		if err != nil {
+			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+				return
+			}
+			if !isContain[value] {
+				isContain[value] = true
+				if value != "" {
+					ans = append(ans, value)
+				}
+			}
+		}
+
+		c.IndentedJSON(http.StatusOK, ans)
+	}
+}
+
+func getByField(fieldName string) func(*gin.Context) {
+	return func(c *gin.Context) {
+		var tasks []Task
+
+		table := pq.QuoteIdentifier(c.Param("username"))
+		column := pq.QuoteIdentifier(fieldName)
+		query := fmt.Sprintf("SELECT * FROM %v WHERE %v = $1", table, column)
+
+		rows, err := db.Query(query, c.Param("value"))
+		if err != nil {
+			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var task Task
+			if err := rows.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
+				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+				return
+			}
+			tasks = append(tasks, task)
+		}
+
+		c.IndentedJSON(http.StatusOK, tasks)
+	}
 }
