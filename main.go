@@ -99,10 +99,10 @@ func register(c *gin.Context) {
 	createTableQuery := `CREATE TABLE %v (
 		task_id serial PRIMARY KEY,
 		body varchar(100) NOT NULL,
-		date varchar(10),
+		date date,
 		project varchar(30),
 		context varchar(30),
-		done BOOLEAN
+		done BOOLEAN DEFAULT FALSE
 	)`
 	createTableQuery = fmt.Sprintf(createTableQuery, pq.QuoteIdentifier(newUser.Username))
 
@@ -201,9 +201,14 @@ func getTasks(c *gin.Context) {
 
 	for rows.Next() {
 		var task Task
-		if err := rows.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
+		var date sql.NullTime
+
+		if err := rows.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
 			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 			return
+		}
+		if date.Valid {
+			task.Date = date.Time.Format("2006-01-02")
 		}
 		tasks = append(tasks, task)
 	}
@@ -248,10 +253,15 @@ func getTaskByID(c *gin.Context) {
 	table := pq.QuoteIdentifier(c.Param("username"))
 	query := fmt.Sprintf("SELECT * FROM %v WHERE task_id = $1", table)
 
+	var date sql.NullTime
+
 	row := db.QueryRow(query, id)
-	if err := row.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
+	if err := row.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
+	}
+	if date.Valid {
+		task.Date = date.Time.Format("2006-01-02")
 	}
 	c.IndentedJSON(http.StatusOK, task)
 }
@@ -303,12 +313,11 @@ func deleteTask(c *gin.Context) {
 
 func getField(fieldName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		isContain := make(map[string]bool, 5)
 		ans := make([]string, 0, 5)
 
 		table := pq.QuoteIdentifier(c.Param("username"))
 		column := pq.QuoteIdentifier(fieldName)
-		query := fmt.Sprintf("SELECT %v FROM %v", column, table)
+		query := fmt.Sprintf("SELECT DISTINCT %v FROM %v", column, table)
 
 		rows, err := db.Query(query)
 		if err != nil {
@@ -318,15 +327,17 @@ func getField(fieldName string) gin.HandlerFunc {
 		defer rows.Close()
 
 		for rows.Next() {
-			var value string
+			var value sql.NullString
 			if err := rows.Scan(&value); err != nil {
 				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 				return
 			}
-			if !isContain[value] {
-				isContain[value] = true
-				if value != "" {
-					ans = append(ans, value)
+			if value.Valid {
+				if fieldName == "date" {
+					value.String = value.String[:10]
+				}
+				if value.String != "" {
+					ans = append(ans, value.String)
 				}
 			}
 		}
@@ -352,9 +363,14 @@ func getByField(fieldName string) func(*gin.Context) {
 
 		for rows.Next() {
 			var task Task
-			if err := rows.Scan(&task.ID, &task.Body, &task.Date, &task.Project, &task.Context, &task.Done); err != nil {
+			var date sql.NullTime
+
+			if err := rows.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
 				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 				return
+			}
+			if date.Valid {
+				task.Date = date.Time.Format("2006-01-02")
 			}
 			tasks = append(tasks, task)
 		}
