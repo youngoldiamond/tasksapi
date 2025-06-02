@@ -12,30 +12,14 @@ import (
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
+	"github.com/youngoldiamond/tasksapi/internal/db"
+	"github.com/youngoldiamond/tasksapi/internal/types"
 )
 
-var db *sql.DB
+var Db *sql.DB
+var DB *db.DB
 
 const secretKey = "my-test-secret-key"
-
-type Task struct {
-	ID      int64  `json:"id"`
-	Body    string `json:"body"`
-	Date    string `json:"date"`
-	Project string `json:"project"`
-	Context string `json:"context"`
-	Done    bool   `json:"done"`
-}
-
-type Credentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type User struct {
-	ID int64
-	Credentials
-}
 
 type Claims struct {
 	Username string `json:"username"`
@@ -43,20 +27,17 @@ type Claims struct {
 }
 
 func main() {
-	pass := os.Getenv("MYPASS")
-	connStr := fmt.Sprintf("user=postgres password=%s dbname=tasks sslmode=disable", pass)
+	cfg := db.DefaultConfig()
+	cfg.Password = os.Getenv("MYPASS")
+
 	var err error
-	db, err = sql.Open("postgres", connStr)
+	DB, err = db.Open(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer DB.Close()
 
-	pingErr := db.Ping()
-	if pingErr != nil {
-		log.Fatal(pingErr)
-	}
-	log.Println("Connected to DB")
+	Db = DB.DB()
 
 	router := setupRouter()
 
@@ -82,7 +63,7 @@ func setupRouter() *gin.Engine {
 }
 
 func register(c *gin.Context) {
-	var newUser User
+	var newUser types.User
 
 	if err := c.BindJSON(&newUser.Credentials); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
@@ -90,7 +71,7 @@ func register(c *gin.Context) {
 	}
 
 	query := `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING user_id`
-	err := db.QueryRow(query, newUser.Username, newUser.Password).Scan(&newUser.ID)
+	err := Db.QueryRow(query, newUser.Username, newUser.Password).Scan(&newUser.ID)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -106,7 +87,7 @@ func register(c *gin.Context) {
 	)`
 	createTableQuery = fmt.Sprintf(createTableQuery, pq.QuoteIdentifier(newUser.Username))
 
-	_, err = db.Exec(createTableQuery)
+	_, err = Db.Exec(createTableQuery)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
@@ -116,15 +97,15 @@ func register(c *gin.Context) {
 }
 
 func login(c *gin.Context) {
-	var credentials Credentials
+	var credentials types.Credentials
 
 	if err := c.BindJSON(&credentials); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
 
-	var user User
-	row := db.QueryRow("SELECT * FROM users WHERE username = $1", credentials.Username)
+	var user types.User
+	row := Db.QueryRow("SELECT * FROM users WHERE username = $1", credentials.Username)
 	if err := row.Scan(&user.ID, &user.Username, &user.Password); err != nil {
 		var mess string
 		if err == sql.ErrNoRows {
@@ -187,62 +168,34 @@ func authMiddleware(c *gin.Context) {
 }
 
 func getTasks(c *gin.Context) {
-	var tasks []Task
 
-	table := pq.QuoteIdentifier(c.Param("username"))
-	query := fmt.Sprintf("SELECT * FROM %v", table)
-
-	rows, err := db.Query(query)
+	tasks, err := DB.Tasks(c.Param("username"))
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var task Task
-		var date sql.NullTime
-
-		if err := rows.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
-			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
-			return
-		}
-		if date.Valid {
-			task.Date = date.Time.Format("2006-01-02")
-		}
-		tasks = append(tasks, task)
 	}
 
 	c.IndentedJSON(http.StatusOK, tasks)
 }
 
 func postTask(c *gin.Context) {
-	var newTask Task
+	var newTask types.Task
 
 	if err := c.BindJSON(&newTask); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
 
-	table := pq.QuoteIdentifier(c.Param("username"))
-	query := fmt.Sprintf("INSERT INTO %v (body, date, project, context, done) VALUES ($1, $2, $3, $4, $5)", table)
-
-	result, err := db.Exec(query, newTask.Body, newTask.Date, newTask.Project, newTask.Context, newTask.Done)
-	if err != nil {
+	if err := DB.AddTask(c.Param("username"), newTask); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
 
-	_, err = result.RowsAffected()
-	if err != nil {
-		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
-		return
-	}
 	c.IndentedJSON(http.StatusCreated, newTask)
 }
 
 func getTaskByID(c *gin.Context) {
-	var task Task
+	var task types.Task
 
 	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
@@ -255,7 +208,7 @@ func getTaskByID(c *gin.Context) {
 
 	var date sql.NullTime
 
-	row := db.QueryRow(query, id)
+	row := Db.QueryRow(query, id)
 	if err := row.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
@@ -267,7 +220,7 @@ func getTaskByID(c *gin.Context) {
 }
 
 func updateTask(c *gin.Context) {
-	var task Task
+	var task types.Task
 
 	id, err := strconv.Atoi(c.Param("taskId"))
 	if err != nil {
@@ -283,7 +236,7 @@ func updateTask(c *gin.Context) {
 	table := pq.QuoteIdentifier(c.Param("username"))
 	query := fmt.Sprintf("UPDATE %v SET body = $1, date = $2, project = $3, context = $4, done = $5 WHERE task_id = $6", table)
 
-	_, err = db.Exec(query, task.Body, task.Date, task.Project, task.Context, task.Done, id)
+	_, err = Db.Exec(query, task.Body, task.Date, task.Project, task.Context, task.Done, id)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -302,7 +255,7 @@ func deleteTask(c *gin.Context) {
 	table := pq.QuoteIdentifier(c.Param("username"))
 	query := fmt.Sprintf("DELETE FROM %v WHERE task_id = $1", table)
 
-	_, err = db.Exec(query, id)
+	_, err = Db.Exec(query, id)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -319,7 +272,7 @@ func getField(fieldName string) gin.HandlerFunc {
 		column := pq.QuoteIdentifier(fieldName)
 		query := fmt.Sprintf("SELECT DISTINCT %v FROM %v", column, table)
 
-		rows, err := db.Query(query)
+		rows, err := Db.Query(query)
 		if err != nil {
 			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 			return
@@ -348,13 +301,13 @@ func getField(fieldName string) gin.HandlerFunc {
 
 func getByField(fieldName string) func(*gin.Context) {
 	return func(c *gin.Context) {
-		var tasks []Task
+		var tasks []types.Task
 
 		table := pq.QuoteIdentifier(c.Param("username"))
 		column := pq.QuoteIdentifier(fieldName)
 		query := fmt.Sprintf("SELECT * FROM %v WHERE %v = $1", table, column)
 
-		rows, err := db.Query(query, c.Param("value"))
+		rows, err := Db.Query(query, c.Param("value"))
 		if err != nil {
 			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 			return
@@ -362,7 +315,7 @@ func getByField(fieldName string) func(*gin.Context) {
 		defer rows.Close()
 
 		for rows.Next() {
-			var task Task
+			var task types.Task
 			var date sql.NullTime
 
 			if err := rows.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
