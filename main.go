@@ -1,8 +1,6 @@
 package main
 
 import (
-	"database/sql"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,12 +9,10 @@ import (
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
 	"github.com/youngoldiamond/tasksapi/internal/db"
 	"github.com/youngoldiamond/tasksapi/internal/types"
 )
 
-var Db *sql.DB
 var DB *db.DB
 
 const secretKey = "my-test-secret-key"
@@ -36,8 +32,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer DB.Close()
-
-	Db = DB.DB()
 
 	router := setupRouter()
 
@@ -70,25 +64,7 @@ func register(c *gin.Context) {
 		return
 	}
 
-	query := `INSERT INTO users (username, password) VALUES ($1, $2) RETURNING user_id`
-	err := Db.QueryRow(query, newUser.Username, newUser.Password).Scan(&newUser.ID)
-	if err != nil {
-		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
-		return
-	}
-
-	createTableQuery := `CREATE TABLE %v (
-		task_id serial PRIMARY KEY,
-		body varchar(100) NOT NULL,
-		date date,
-		project varchar(30),
-		context varchar(30),
-		done BOOLEAN DEFAULT FALSE
-	)`
-	createTableQuery = fmt.Sprintf(createTableQuery, pq.QuoteIdentifier(newUser.Username))
-
-	_, err = Db.Exec(createTableQuery)
-	if err != nil {
+	if err := DB.AddUser(&newUser); err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
@@ -104,21 +80,15 @@ func login(c *gin.Context) {
 		return
 	}
 
-	var user types.User
-	row := Db.QueryRow("SELECT * FROM users WHERE username = $1", credentials.Username)
-	if err := row.Scan(&user.ID, &user.Username, &user.Password); err != nil {
-		var mess string
-		if err == sql.ErrNoRows {
-			mess = "Invalid username"
-		} else {
-			mess = err.Error()
-		}
-		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": mess})
+	user, err := DB.User(credentials.Username)
+	if err != nil {
+		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
 	if user.Password != credentials.Password {
 		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": "Invalid password"})
+		return
 	}
 
 	expirationTime := time.Now().Add(time.Minute * 5)
@@ -195,34 +165,25 @@ func postTask(c *gin.Context) {
 }
 
 func getTaskByID(c *gin.Context) {
-	var task types.Task
-
-	id, err := strconv.Atoi(c.Param("taskId"))
+	id, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
 	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "Invalid task's ID"})
 		return
 	}
 
-	table := pq.QuoteIdentifier(c.Param("username"))
-	query := fmt.Sprintf("SELECT * FROM %v WHERE task_id = $1", table)
-
-	var date sql.NullTime
-
-	row := Db.QueryRow(query, id)
-	if err := row.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
+	task, err := DB.Task(c.Param("username"), id)
+	if err != nil {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 		return
 	}
-	if date.Valid {
-		task.Date = date.Time.Format("2006-01-02")
-	}
+
 	c.IndentedJSON(http.StatusOK, task)
 }
 
 func updateTask(c *gin.Context) {
 	var task types.Task
 
-	id, err := strconv.Atoi(c.Param("taskId"))
+	id, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid task's ID"})
 		return
@@ -233,11 +194,7 @@ func updateTask(c *gin.Context) {
 		return
 	}
 
-	table := pq.QuoteIdentifier(c.Param("username"))
-	query := fmt.Sprintf("UPDATE %v SET body = $1, date = $2, project = $3, context = $4, done = $5 WHERE task_id = $6", table)
-
-	_, err = Db.Exec(query, task.Body, task.Date, task.Project, task.Context, task.Done, id)
-	if err != nil {
+	if err := DB.UpdateTask(c.Param("username"), id, task); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
@@ -246,17 +203,13 @@ func updateTask(c *gin.Context) {
 }
 
 func deleteTask(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("taskId"))
+	id, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid task's ID"})
 		return
 	}
 
-	table := pq.QuoteIdentifier(c.Param("username"))
-	query := fmt.Sprintf("DELETE FROM %v WHERE task_id = $1", table)
-
-	_, err = Db.Exec(query, id)
-	if err != nil {
+	if err := DB.DeleteTask(c.Param("username"), id); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
@@ -266,66 +219,24 @@ func deleteTask(c *gin.Context) {
 
 func getField(fieldName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ans := make([]string, 0, 5)
 
-		table := pq.QuoteIdentifier(c.Param("username"))
-		column := pq.QuoteIdentifier(fieldName)
-		query := fmt.Sprintf("SELECT DISTINCT %v FROM %v", column, table)
-
-		rows, err := Db.Query(query)
+		values, err := DB.Field(c.Param("username"), fieldName)
 		if err != nil {
 			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 			return
 		}
-		defer rows.Close()
 
-		for rows.Next() {
-			var value sql.NullString
-			if err := rows.Scan(&value); err != nil {
-				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
-				return
-			}
-			if value.Valid {
-				if fieldName == "date" {
-					value.String = value.String[:10]
-				}
-				if value.String != "" {
-					ans = append(ans, value.String)
-				}
-			}
-		}
-
-		c.IndentedJSON(http.StatusOK, ans)
+		c.IndentedJSON(http.StatusOK, values)
 	}
 }
 
 func getByField(fieldName string) func(*gin.Context) {
 	return func(c *gin.Context) {
-		var tasks []types.Task
 
-		table := pq.QuoteIdentifier(c.Param("username"))
-		column := pq.QuoteIdentifier(fieldName)
-		query := fmt.Sprintf("SELECT * FROM %v WHERE %v = $1", table, column)
-
-		rows, err := Db.Query(query, c.Param("value"))
+		tasks, err := DB.TasksByField(c.Param("username"), fieldName, c.Param("value"))
 		if err != nil {
 			c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
 			return
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var task types.Task
-			var date sql.NullTime
-
-			if err := rows.Scan(&task.ID, &task.Body, &date, &task.Project, &task.Context, &task.Done); err != nil {
-				c.IndentedJSON(http.StatusNotFound, gin.H{"message": err.Error()})
-				return
-			}
-			if date.Valid {
-				task.Date = date.Time.Format("2006-01-02")
-			}
-			tasks = append(tasks, task)
 		}
 
 		c.IndentedJSON(http.StatusOK, tasks)
