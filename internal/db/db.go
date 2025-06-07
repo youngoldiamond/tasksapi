@@ -257,7 +257,7 @@ func (d *DB) User(username string) (*types.User, error) {
 	row := d.db.QueryRow("SELECT * FROM users WHERE username = $1", username)
 	if err := row.Scan(&user.ID, &user.Username, &user.Password); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("db: Invalid username")
+			return nil, fmt.Errorf("db: invalid username")
 		} else {
 			return nil, err
 		}

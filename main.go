@@ -5,22 +5,18 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
-	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
+	"github.com/youngoldiamond/tasksapi/internal/auth"
 	"github.com/youngoldiamond/tasksapi/internal/db"
 	"github.com/youngoldiamond/tasksapi/internal/types"
 )
 
+// Структура данных для взаимодействия с БД
 var DB *db.DB
 
-const secretKey = "my-test-secret-key"
-
-type Claims struct {
-	Username string `json:"username"`
-	jwt.StandardClaims
-}
+// Структура данных для алгоритмов авторизации
+var Auth *auth.Auth
 
 func main() {
 	cfg := db.DefaultConfig()
@@ -33,11 +29,14 @@ func main() {
 	}
 	defer DB.Close()
 
+	Auth = auth.New(auth.DefaultConfig(), DB)
+
 	router := setupRouter()
 
 	router.Run("localhost:8080")
 }
 
+// Настройка gin
 func setupRouter() *gin.Engine {
 	router := gin.Default()
 	router.POST("/register", register)
@@ -56,6 +55,7 @@ func setupRouter() *gin.Engine {
 	return router
 }
 
+// Регистрация нововго пользователя
 func register(c *gin.Context) {
 	var newUser types.User
 
@@ -72,6 +72,7 @@ func register(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, gin.H{"message": "User registered successfully"})
 }
 
+// login пользователя
 func login(c *gin.Context) {
 	var credentials types.Credentials
 
@@ -80,56 +81,20 @@ func login(c *gin.Context) {
 		return
 	}
 
-	user, err := DB.User(credentials.Username)
+	tokenString, err := Auth.Login(credentials)
 	if err != nil {
 		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		return
 	}
 
-	if user.Password != credentials.Password {
-		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": "Invalid password"})
-		return
-	}
-
-	expirationTime := time.Now().Add(time.Minute * 5)
-	claims := &Claims{
-		Username: credentials.Username,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: expirationTime.Unix(),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-	tokeString, err := token.SignedString([]byte(secretKey))
-	if err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
-		return
-	}
-
-	c.IndentedJSON(http.StatusOK, gin.H{"token": tokeString})
+	c.IndentedJSON(http.StatusOK, gin.H{"token": tokenString})
 }
 
+// Авторизация
 func authMiddleware(c *gin.Context) {
-	tokenString := c.GetHeader("Authorization")
-	if tokenString == "" {
-		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": "Missing token"})
-		c.Abort()
-		return
-	}
 
-	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
-		return []byte(secretKey), nil
-	})
-
-	if err != nil || !token.Valid {
-		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
-		c.Abort()
-		return
-	}
-
-	if claims.Username != c.Param("username") {
-		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "You don't have access"})
+	if err := Auth.CheckToken(c.Param("username"), c.GetHeader("Authorization")); err != nil {
+		c.IndentedJSON(http.StatusUnauthorized, gin.H{"message": err.Error()})
 		c.Abort()
 		return
 	}
@@ -137,6 +102,7 @@ func authMiddleware(c *gin.Context) {
 	c.Next()
 }
 
+// Выводит все задачи пользователя
 func getTasks(c *gin.Context) {
 
 	tasks, err := DB.Tasks(c.Param("username"))
@@ -148,6 +114,7 @@ func getTasks(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, tasks)
 }
 
+// Добавляет новую задачу
 func postTask(c *gin.Context) {
 	var newTask types.Task
 
@@ -164,6 +131,7 @@ func postTask(c *gin.Context) {
 	c.IndentedJSON(http.StatusCreated, newTask)
 }
 
+// Выводит задачу по ID
 func getTaskByID(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
 	if err != nil {
@@ -180,6 +148,7 @@ func getTaskByID(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, task)
 }
 
+// Изменяет задачу
 func updateTask(c *gin.Context) {
 	var task types.Task
 
@@ -202,6 +171,7 @@ func updateTask(c *gin.Context) {
 	c.IndentedJSON(http.StatusCreated, task)
 }
 
+// Удаляет задачу
 func deleteTask(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
 	if err != nil {
@@ -217,6 +187,7 @@ func deleteTask(c *gin.Context) {
 	c.IndentedJSON(http.StatusOK, gin.H{"message": "Task was deleted successfully"})
 }
 
+// Выводит все различающиеся значения поля
 func getField(fieldName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
@@ -230,6 +201,7 @@ func getField(fieldName string) gin.HandlerFunc {
 	}
 }
 
+// Выводит задачи по значению поля
 func getByField(fieldName string) func(*gin.Context) {
 	return func(c *gin.Context) {
 
